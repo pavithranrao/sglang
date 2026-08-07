@@ -1413,6 +1413,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         current_output_index = 0
         current_item_id = f"item_{random_uuid()}"
         sent_output_item_added = False
+        wants_logprobs = self._wants_responses_logprobs(request)
 
         initial_response = ResponsesResponse.from_request(
             request,
@@ -1488,10 +1489,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
                     elif previous_item.channel == "final":
+                        done_logprobs_msg = None
+                        done_logprobs_event = None
+                        if wants_logprobs:
+                            done_logprobs_msg = to_responses_output_text_logprobs(
+                                ctx.final_token_logprobs,
+                                ctx.final_top_logprobs,
+                            )
+                            done_logprobs_event = to_responses_text_done_logprobs(
+                                ctx.final_token_logprobs,
+                                ctx.final_top_logprobs,
+                            )
                         text_content = openai_responses_types.ResponseOutputText(
                             type="output_text",
                             text=previous_item.content[0].text,
                             annotations=[],
+                            logprobs=done_logprobs_msg,
                         )
                         yield _send_event(
                             openai_responses_types.ResponseTextDoneEvent(
@@ -1500,7 +1513,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 output_index=current_output_index,
                                 content_index=current_content_index,
                                 text=previous_item.content[0].text,
-                                logprobs=[],
+                                logprobs=done_logprobs_event or [],
                                 item_id=current_item_id,
                             )
                         )
@@ -1565,6 +1578,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ),
                             )
                         )
+                    delta_logprobs = []
+                    if wants_logprobs and ctx.last_delta_logprob is not None:
+                        delta_top = (
+                            [ctx.last_delta_top_logprob]
+                            if ctx.last_delta_top_logprob is not None
+                            else None
+                        )
+                        delta_logprobs = (
+                            to_responses_text_delta_logprobs(
+                                [ctx.last_delta_logprob], delta_top
+                            )
+                            or []
+                        )
                     yield _send_event(
                         openai_responses_types.ResponseTextDeltaEvent(
                             type="response.output_text.delta",
@@ -1573,8 +1599,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             output_index=current_output_index,
                             item_id=current_item_id,
                             delta=ctx.parser.last_content_delta,
-                            # TODO, use logprobs from ctx.last_request_output
-                            logprobs=[],
+                            logprobs=delta_logprobs,
                         )
                     )
                 elif (

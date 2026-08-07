@@ -11,7 +11,11 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 from openai_harmony import Message, Role
 from utils import make_serving
 
-from sglang.srt.entrypoints.context import HarmonyContext, SimpleContext
+from sglang.srt.entrypoints.context import (
+    HarmonyContext,
+    SimpleContext,
+    StreamingHarmonyContext,
+)
 from sglang.srt.entrypoints.harmony_utils import (
     get_streamable_parser_for_assistant,
     render_for_completion,
@@ -838,6 +842,79 @@ class HarmonyLogprobsTestCase(unittest.TestCase):
             i for i in items_none if isinstance(i, ResponseOutputMessage)
         ][0].content[0]
         self.assertIsNone(text_part_none.logprobs)
+
+
+class StreamingHarmonyLogprobsTestCase(unittest.TestCase):
+    """Streaming harmony logprobs: bucketing across incremental and cumulative
+    chunks, plus per-chunk delta tracking for the delta event."""
+
+    @staticmethod
+    def _token_info(answer_text: str):
+        """Return (gen_toks, info) where info[i] = (delta, channel) for token i,
+        from an independent parser pass."""
+        gen_toks = HarmonyLogprobsTestCase._final_answer_tokens(answer_text)
+        parser = get_streamable_parser_for_assistant()
+        info = []
+        for tok in gen_toks:
+            parser.process(tok)
+            info.append((parser.last_content_delta, parser.current_channel))
+        return gen_toks, info
+
+    @staticmethod
+    def _lp(i: int, tok: int, delta):
+        return (-0.1 * i, tok, delta if delta else f"STRUCT{i}")
+
+    def test_incremental_chunks_bucket_and_track_delta(self):
+        gen_toks, info = self._token_info("Hello!")
+        ctx = StreamingHarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        for i, tok in enumerate(gen_toks):
+            delta, channel = info[i]
+            ctx.append_output(
+                {
+                    "output_ids": [tok],
+                    "meta_info": {"output_token_logprobs": [self._lp(i, tok, delta)]},
+                }
+            )
+            # last_delta_logprob tracks the chunk's last final-content token,
+            # and is None when the chunk added none.
+            if channel == "final" and delta:
+                self.assertIsNotNone(ctx.last_delta_logprob)
+                self.assertEqual(ctx.last_delta_logprob[2], self._lp(i, tok, delta)[2])
+            else:
+                self.assertIsNone(ctx.last_delta_logprob)
+
+        self.assertEqual("".join(lp[2] for lp in ctx.final_token_logprobs), "Hello!")
+
+    def test_cumulative_chunks_slice_logprobs_without_duplication(self):
+        gen_toks, info = self._token_info("Hello!")
+        all_lps = [self._lp(i, tok, info[i][0]) for i, tok in enumerate(gen_toks)]
+        ctx = StreamingHarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        # Cumulative streaming: each chunk re-sends all tokens so far; the
+        # context must process only the new slice each step.
+        for n in range(1, len(gen_toks) + 1):
+            ctx.append_output(
+                {
+                    "output_ids": gen_toks[:n],
+                    "meta_info": {
+                        "output_token_logprobs": all_lps[:n],
+                        "completion_tokens": n,
+                    },
+                }
+            )
+        # Correct slicing ⇒ each final-content token captured exactly once.
+        self.assertEqual("".join(lp[2] for lp in ctx.final_token_logprobs), "Hello!")
 
 
 if __name__ == "__main__":
