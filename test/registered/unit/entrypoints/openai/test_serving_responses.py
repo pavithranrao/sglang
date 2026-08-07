@@ -8,9 +8,15 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai_harmony import Message, Role
 from utils import make_serving
 
-from sglang.srt.entrypoints.context import SimpleContext
+from sglang.srt.entrypoints.context import HarmonyContext, SimpleContext
+from sglang.srt.entrypoints.harmony_utils import (
+    get_streamable_parser_for_assistant,
+    render_for_completion,
+)
+from sglang.srt.entrypoints.openai.utils import to_responses_output_text_logprobs
 from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     RequestResponseMetadata,
@@ -741,6 +747,97 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         ]
         msg = get_developer_message(instructions="be helpful", tools=tools)
         self.assertIsNotNone(msg)
+
+
+class HarmonyLogprobsTestCase(unittest.TestCase):
+    """Non-streaming harmony logprobs: capture final-channel content tokens
+    and attach them to the final ResponseOutputText."""
+
+    @staticmethod
+    def _final_answer_tokens(answer_text: str) -> list[int]:
+        """Return the assistant-generated harmony token ids (turn header +
+        final-channel content + <|return|>) for *answer_text*."""
+        sys_msg = Message.from_role_and_content(Role.SYSTEM, "x")
+        user_msg = Message.from_role_and_content(Role.USER, "q")
+        final_msg = Message.from_role_and_content(Role.ASSISTANT, answer_text)
+        final_msg = final_msg.with_channel("final")
+        all_toks = render_for_completion([sys_msg, user_msg, final_msg])
+        prompt_toks = render_for_completion([sys_msg, user_msg])
+        return all_toks[len(prompt_toks):]
+
+    @staticmethod
+    def _engine_output(token_ids: list[int]) -> dict:
+        """Build an engine chunk whose logprob token_text is the delta each
+        token emits (from an independent parser pass) so captured texts
+        reconstruct the visible answer; structural tokens get a sentinel."""
+        parser = get_streamable_parser_for_assistant()
+        token_logprobs = []
+        for i, tok in enumerate(token_ids):
+            parser.process(tok)
+            delta = parser.last_content_delta
+            token_logprobs.append((-0.1 * i, tok, delta if delta else f"STRUCT{i}"))
+        return {
+            "output_ids": token_ids,
+            "meta_info": {
+                "output_token_logprobs": token_logprobs,
+                "output_top_logprobs": None,
+                "prompt_tokens": 5,
+                "completion_tokens": len(token_ids),
+                "cached_tokens": 0,
+            },
+        }
+
+    def test_append_output_buckets_only_final_channel_content(self):
+        gen_toks = self._final_answer_tokens("Hello!")
+        context = HarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        context.append_output(self._engine_output(gen_toks))
+
+        captured = context.final_token_logprobs
+        # Only the final-channel content tokens survive; their texts reconstruct
+        # the visible answer, proving no reasoning/structural tokens leaked in.
+        self.assertEqual("".join(lp[2] for lp in captured), "Hello!")
+        self.assertTrue(captured)
+        self.assertFalse(any(lp[2].startswith("STRUCT") for lp in captured))
+
+    def test_make_output_items_attaches_logprobs_only_when_requested(self):
+        serving = make_serving()
+        gen_toks = self._final_answer_tokens("Hello!")
+        context = HarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        context.append_output(self._engine_output(gen_toks))
+
+        final_logprobs = to_responses_output_text_logprobs(
+            context.final_token_logprobs, context.final_top_logprobs
+        )
+        items = serving._make_response_output_items_with_harmony(
+            context, final_logprobs=final_logprobs
+        )
+        msg = [i for i in items if isinstance(i, ResponseOutputMessage)]
+        self.assertEqual(len(msg), 1)
+        text_part = msg[0].content[0]
+        self.assertIsInstance(text_part, ResponseOutputText)
+        self.assertIsNotNone(text_part.logprobs)
+        self.assertEqual(len(text_part.logprobs), len(context.final_token_logprobs))
+
+        # No logprobs when the caller passes None (request didn't ask for them).
+        items_none = serving._make_response_output_items_with_harmony(
+            context, final_logprobs=None
+        )
+        text_part_none = [
+            i for i in items_none if isinstance(i, ResponseOutputMessage)
+        ][0].content[0]
+        self.assertIsNone(text_part_none.logprobs)
 
 
 if __name__ == "__main__":

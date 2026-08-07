@@ -2,7 +2,7 @@
 # Copied from vLLM
 import logging
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Optional, Union
 
 import orjson
 
@@ -79,16 +79,45 @@ class HarmonyContext(ConversationContext):
         self.num_cached_tokens = 0
         self.num_output_tokens = 0
         self.num_reasoning_tokens = 0
+        # Logprobs for the tokens that decode to the visible ``final``-channel
+        # answer. Bucketed during append_output by tracking the parser's current
+        # channel, so reasoning / structural tokens are excluded. Parallel lists:
+        # one (logprob, token_id, token_text) per captured token, and (for
+        # top_logprobs requests) one top-k list per captured token.
+        self.final_token_logprobs: list = []
+        self.final_top_logprobs: Optional[list] = None
 
     def append_output(self, output) -> None:
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
 
-            for token_id in output_token_ids:
-                self.parser.process(token_id)
-            output_msgs = self.parser.messages
-
             meta_info = output["meta_info"]
+            token_logprobs = None
+            top_logprobs = None
+            if isinstance(meta_info, dict):
+                token_logprobs = meta_info.get("output_token_logprobs")
+                top_logprobs = meta_info.get("output_top_logprobs")
+
+            for i, token_id in enumerate(output_token_ids):
+                self.parser.process(token_id)
+                # Bucket logprobs for the visible answer: only tokens the parser
+                # attributes to the ``final`` channel AND that emit text.
+                # Structural tokens (headers, <|message|>, <|return|>) are
+                # excluded because last_content_delta is empty for them.
+                if (
+                    token_logprobs is not None
+                    and self.parser.current_channel == "final"
+                    and self.parser.last_content_delta
+                ):
+                    self.final_token_logprobs.append(token_logprobs[i])
+                    if top_logprobs is not None:
+                        if self.final_top_logprobs is None:
+                            self.final_top_logprobs = []
+                        self.final_top_logprobs.append(
+                            top_logprobs[i] if i < len(top_logprobs) else None
+                        )
+
+            output_msgs = self.parser.messages
 
             if isinstance(meta_info, dict):
                 if "prompt_token_ids" in meta_info:
