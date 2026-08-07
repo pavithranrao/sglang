@@ -11,11 +11,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     StreamOptions,
 )
 
-from openai.types.responses.response_output_text import (
-    Logprob as ResponsesLogprob,
-    LogprobTopLogprob as ResponsesLogprobTopLogprob,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -59,7 +54,7 @@ def to_openai_style_logprobs(
 def to_responses_style_logprobs(
     output_token_logprobs=None,
     output_top_logprobs=None,
-) -> Optional[List[ResponsesLogprob]]:
+) -> Optional[List[Dict[str, Any]]]:
     """Convert internal logprob data to the OpenAI Responses API format.
 
     Each entry in *output_token_logprobs* is a ``(logprob, token_id, token_text)``
@@ -67,37 +62,45 @@ def to_responses_style_logprobs(
     Each entry in *output_top_logprobs* is a list of the same tuples (the
     top-k alternatives for that position) or ``None``.
 
-    Returns a list of ``ResponseOutputText.Logprob`` objects, one per output
+    Returns a list of dicts matching the ``Logprob`` schema, one per output
     token, or ``None`` when no logprob data is available.
+
+    The result uses plain dicts rather than Pydantic ``Logprob`` model
+    instances because the OpenAI SDK defines separate ``Logprob`` classes
+    per event module (``response_text_delta_event``,
+    ``response_output_text``, ``response_text_done_event``) and Pydantic
+    rejects cross-module instances.  In the streaming done path the result
+    is shared between ``ResponseOutputText`` and
+    ``ResponseTextDoneEvent``, which need different ``Logprob`` types, so
+    dicts are the only format accepted by both.
     """
     if not output_token_logprobs:
         return None
 
-    result: List[ResponsesLogprob] = []
+    result: List[Dict[str, Any]] = []
     for i, (logprob, _token_id, token_text) in enumerate(output_token_logprobs):
         token_bytes = list(token_text.encode("utf-8"))
 
-        top_logprobs: List[ResponsesLogprobTopLogprob] = []
+        top_logprobs: List[Dict[str, Any]] = []
         if output_top_logprobs is not None and i < len(output_top_logprobs):
             inner = output_top_logprobs[i]
             if inner is not None:
                 for tp_logprob, _tp_token_id, tp_token_text in inner:
-                    tp_str = tp_token_text
                     top_logprobs.append(
-                        ResponsesLogprobTopLogprob(
-                            token=tp_str,
-                            bytes=list(tp_str.encode("utf-8")),
-                            logprob=tp_logprob,
-                        )
+                        {
+                            "token": tp_token_text,
+                            "bytes": list(tp_token_text.encode("utf-8")),
+                            "logprob": tp_logprob,
+                        }
                     )
 
         result.append(
-            ResponsesLogprob(
-                token=token_text,
-                bytes=token_bytes,
-                logprob=logprob,
-                top_logprobs=top_logprobs,
-            )
+            {
+                "token": token_text,
+                "bytes": token_bytes,
+                "logprob": logprob,
+                "top_logprobs": top_logprobs,
+            }
         )
 
     return result
