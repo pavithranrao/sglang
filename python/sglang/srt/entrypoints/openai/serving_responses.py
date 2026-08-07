@@ -54,7 +54,9 @@ from sglang.srt.entrypoints.harmony_utils import (
     render_for_completion,
 )
 from sglang.srt.entrypoints.openai.utils import (
-    to_responses_style_logprobs,
+    to_responses_output_text_logprobs,
+    to_responses_text_delta_logprobs,
+    to_responses_text_done_logprobs,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
@@ -819,7 +821,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and "message.output_text.logprobs" in request.include
             )
             if wants_logprobs:
-                logprobs = to_responses_style_logprobs(
+                logprobs = to_responses_output_text_logprobs(
                     output_token_logprobs=output_token_logprobs,
                     output_top_logprobs=output_top_logprobs,
                 )
@@ -2022,14 +2024,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         def _close_message_item():
             if not message_state["open"]:
                 return []
-            done_logprobs = None
+            done_logprobs_msg = None
+            done_logprobs_event = None
             if wants_logprobs:
-                done_logprobs = to_responses_style_logprobs(
+                done_logprobs_msg = to_responses_output_text_logprobs(
+                    output_token_logprobs=all_token_logprobs,
+                    output_top_logprobs=all_top_logprobs,
+                )
+                done_logprobs_event = to_responses_text_done_logprobs(
                     output_token_logprobs=all_token_logprobs,
                     output_top_logprobs=all_top_logprobs,
                 )
             text_content = openai_responses_types.ResponseOutputText(
-                type="output_text", text=message_state["text"], annotations=[], logprobs=done_logprobs
+                type="output_text", text=message_state["text"], annotations=[], logprobs=done_logprobs_msg
             )
             completed_item = ResponseOutputMessage(
                 id=message_state["item_id"],
@@ -2046,7 +2053,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         output_index=message_state["output_index"],
                         content_index=0,
                         text=message_state["text"],
-                        logprobs=done_logprobs or [],
+                        logprobs=done_logprobs_event or [],
                         item_id=message_state["item_id"],
                     )
                 ),
@@ -2150,7 +2157,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             all_top_logprobs = []
                         all_top_logprobs.extend(new_top_lps)
                     delta_logprobs = (
-                        to_responses_style_logprobs(
+                        to_responses_text_delta_logprobs(
                             output_token_logprobs=new_token_lps,
                             output_top_logprobs=new_top_lps,
                         )
