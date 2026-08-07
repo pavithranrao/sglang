@@ -565,7 +565,15 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
-            output = self._make_response_output_items_with_harmony(context)
+            final_logprobs = None
+            if self._wants_responses_logprobs(request):
+                final_logprobs = to_responses_output_text_logprobs(
+                    context.final_token_logprobs,
+                    context.final_top_logprobs,
+                )
+            output = self._make_response_output_items_with_harmony(
+                context, final_logprobs=final_logprobs
+            )
             # num_reasoning_tokens isn't wired through HarmonyContext yet; stays 0.
             num_prompt_tokens = context.num_prompt_tokens
             num_generated_tokens = context.num_output_tokens
@@ -667,6 +675,15 @@ class OpenAIServingResponses(OpenAIServingChat):
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
         return request.reasoning is not None and request.reasoning.summary is not None
+
+    @staticmethod
+    def _wants_responses_logprobs(request: ResponsesRequest) -> bool:
+        return (
+            request.top_logprobs is not None and request.top_logprobs > 0
+        ) or (
+            request.include is not None
+            and "message.output_text.logprobs" in request.include
+        )
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
         if not self.reasoning_parser:
@@ -845,6 +862,8 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _make_response_output_items_with_harmony(
         self,
         context: HarmonyContext,
+        *,
+        final_logprobs: Optional[list] = None,
     ):
         output_items = []
         num_init_messages = context.num_init_messages
@@ -854,6 +873,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         last_items = parse_remaining_state(context.parser)
         if last_items:
             output_items.extend(last_items)
+
+        # Every ResponseOutputText produced above is ``final``-channel (the
+        # harmony builders only create output text for the final channel), so
+        # attach the captured final-channel logprobs to each.
+        if final_logprobs:
+            for item in output_items:
+                if not isinstance(item, ResponseOutputMessage):
+                    continue
+                for content in item.content:
+                    if isinstance(content, ResponseOutputText):
+                        content.logprobs = final_logprobs
         return output_items
 
     @staticmethod
