@@ -47,18 +47,27 @@ class _StreamFixture:
         return asyncio.run(collect())
 
 
-def _engine_chunk(text, completion_tokens, *, finish=False):
-    return {
-        "text": text,
-        "meta_info": {
-            "id": "rid",
-            "prompt_tokens": 5,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": 0,
-            "reasoning_tokens": 0,
-            "finish_reason": {"type": "stop"} if finish else None,
-        },
+def _engine_chunk(
+    text,
+    completion_tokens,
+    *,
+    finish=False,
+    token_logprobs=None,
+    top_logprobs=None,
+):
+    meta = {
+        "id": "rid",
+        "prompt_tokens": 5,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "finish_reason": {"type": "stop"} if finish else None,
     }
+    if token_logprobs is not None:
+        meta["output_token_logprobs"] = token_logprobs
+    if top_logprobs is not None:
+        meta["output_top_logprobs"] = top_logprobs
+    return {"text": text, "meta_info": meta}
 
 
 class NonHarmonyStreamTestCase(unittest.TestCase):
@@ -221,6 +230,148 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         self.assertEqual(output[0]["content"][0]["text"], "I'll check.")
         self.assertEqual(output[1]["name"], "get_weather")
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
+
+
+class StreamLogprobsTestCase(unittest.TestCase):
+    def _delta_events(self, events):
+        payloads = event_payloads(events)
+        return [p for p in payloads if p["type"] == "response.output_text.delta"]
+
+    def _done_payload(self, events):
+        for p in event_payloads(events):
+            if p["type"] == "response.output_text.done":
+                return p
+        raise AssertionError("response.output_text.done missing")
+
+    def test_delta_events_carry_per_chunk_logprobs(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x", input="hi", stream=True, top_logprobs=2, store=False
+        )
+
+        # Each chunk carries cumulative text + cumulative logprobs.
+        chunk1_lp = [(-0.5, 313, "Hel")]
+        chunk1_top = [[(-0.5, 313, "Hel"), (-1.2, 999, "Hi")]]
+        chunk2_lp = [(-0.5, 313, "Hel"), (-0.3, 414, "lo")]
+        chunk2_top = [
+            [(-0.5, 313, "Hel"), (-1.2, 999, "Hi")],
+            [(-0.3, 414, "lo"), (-2.0, 888, "Lo")],
+        ]
+
+        chunks = [
+            _engine_chunk(
+                "Hel", 1, token_logprobs=chunk1_lp, top_logprobs=chunk1_top
+            ),
+            _engine_chunk(
+                "Hello", 2, token_logprobs=chunk2_lp, top_logprobs=chunk2_top
+            ),
+            _engine_chunk("Hello world", 3, finish=True),
+        ]
+
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run(chunks)
+        deltas = self._delta_events(events)
+
+        # Two delta events ("Hel" then "lo"), each with logprobs.
+        self.assertEqual(len(deltas), 2)
+        self.assertEqual(len(deltas[0]["logprobs"]), 1)
+        self.assertEqual(deltas[0]["logprobs"][0]["token"], "Hel")
+        self.assertEqual(deltas[0]["logprobs"][0]["logprob"], -0.5)
+        self.assertEqual(len(deltas[0]["logprobs"][0]["top_logprobs"]), 2)
+
+        # Second delta only carries the new token (n_prev_logprobs slicing).
+        self.assertEqual(len(deltas[1]["logprobs"]), 1)
+        self.assertEqual(deltas[1]["logprobs"][0]["token"], "lo")
+
+    def test_done_event_carries_full_accumulated_logprobs(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x", input="hi", stream=True, top_logprobs=1, store=False
+        )
+
+        chunk1_lp = [(-0.5, 313, "Hel")]
+        chunk1_top = [[(-0.5, 313, "Hel")]]
+        chunk2_lp = [(-0.5, 313, "Hel"), (-0.3, 414, "lo")]
+
+        chunks = [
+            _engine_chunk(
+                "Hel", 1, token_logprobs=chunk1_lp, top_logprobs=chunk1_top
+            ),
+            _engine_chunk(
+                "Hello", 2, token_logprobs=chunk2_lp, top_logprobs=None
+            ),
+            _engine_chunk("Hello world", 3, finish=True),
+        ]
+
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run(chunks)
+        done = self._done_payload(events)
+
+        # The done event should hold all accumulated logprobs.
+        self.assertEqual(len(done["logprobs"]), 2)
+        self.assertEqual(done["logprobs"][0]["token"], "Hel")
+        self.assertEqual(done["logprobs"][1]["token"], "lo")
+
+    def test_no_logprobs_when_not_requested(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x", input="hi", stream=True, store=False
+        )
+
+        chunks = [
+            _engine_chunk(
+                "Hel", 1, token_logprobs=[(-0.5, 313, "Hel")]
+            ),
+            _engine_chunk("Hello", 2, finish=True),
+        ]
+
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run(chunks)
+        deltas = self._delta_events(events)
+
+        self.assertTrue(deltas)
+        for d in deltas:
+            self.assertEqual(d["logprobs"], [])
+
+    def test_include_list_triggers_streaming_logprobs(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            top_logprobs=0,
+            include=["message.output_text.logprobs"],
+            store=False,
+        )
+
+        chunks = [
+            _engine_chunk(
+                "Hi", 1, token_logprobs=[(-0.1, 42, "Hi")]
+            ),
+            _engine_chunk("Hi!", 2, finish=True),
+        ]
+
+        fixture = _StreamFixture(serving, request)
+        events = fixture.run(chunks)
+        deltas = self._delta_events(events)
+
+        self.assertEqual(len(deltas), 1)
+        self.assertEqual(len(deltas[0]["logprobs"]), 1)
+        self.assertEqual(deltas[0]["logprobs"][0]["token"], "Hi")
+        # top_logprobs=0 -> empty alternatives.
+        self.assertEqual(len(deltas[0]["logprobs"][0]["top_logprobs"]), 0)
 
 
 if __name__ == "__main__":
